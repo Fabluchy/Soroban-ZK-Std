@@ -375,6 +375,8 @@ fn full_pipeline_fits_one_transaction_with_headroom() {
         wire_evaluations: [u256::from(1u8), u256::from(2u8), u256::from(3u8)],
         sigma_evaluations: [u256::from(4u8), u256::from(5u8)],
         z_omega_evaluation: u256::from(6u8),
+        z_evaluation: u256::from(9u8),
+        s_sigma3_evaluation: u256::from(10u8),
         quotient_evaluation: u256::from(7u8),
         linearization_evaluation: u256::from(8u8),
     };

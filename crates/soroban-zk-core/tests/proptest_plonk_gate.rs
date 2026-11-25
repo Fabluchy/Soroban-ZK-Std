@@ -59,6 +59,8 @@ fn proof_with_evals(wire: [u256; 3], sigma: [u256; 2], z_omega: u256) -> PlonkPr
         wire_evaluations: wire,
         sigma_evaluations: sigma,
         z_omega_evaluation: z_omega,
+        z_evaluation: ZERO,
+        s_sigma3_evaluation: ZERO,
         quotient_evaluation: ZERO,
         linearization_evaluation: ZERO,
     }

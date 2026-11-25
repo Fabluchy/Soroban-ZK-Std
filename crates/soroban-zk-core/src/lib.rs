@@ -420,8 +420,11 @@ pub use ipa_generators::{
     commit_generators, ct_select_affine, fold_generators, fold_generators_rounds, GeneratorVec,
 };
 pub use plonk::{
-    kzg_eval_proof_points, plonk_batch_verify_points, KzgEvalProofInputs, PlonkConfig, PlonkField,
-    PlonkProof,
+    barycentric_pi_evaluation, evaluate_linearization, kzg_eval_proof_points,
+    plonk_batch_seed_from_inputs, plonk_batch_verify_points, plonk_batch_verify_points_derived,
+    split_quotient_commitment, CommitEvaluations, DomainParams, KzgEvalProofInputs,
+    PlonkChallenges, PlonkConfig, PlonkField, PlonkFullChallenges, PlonkProof, PlonkTranscript,
+    SelectorEvaluations, MAX_BARYCENTRIC_INPUTS, PLONK_PROOF_BYTES,
 };
 pub use polynomial::{DensePolynomial, SparsePolynomial};
 

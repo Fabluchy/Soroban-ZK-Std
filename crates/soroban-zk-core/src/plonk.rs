@@ -16,6 +16,7 @@
 //! the boundary with `Bn254::is_valid_scalar` / `Fr::safe_from`).
 
 use ethnum::u256;
+use sha2::{Digest, Sha256};
 
 use crate::{Bn254, G1Affine, G1Projective, ZkError};
 
@@ -41,6 +42,15 @@ pub struct PlonkProof {
     pub sigma_evaluations: [u256; 2],
     /// Permutation evaluation `z(zeta*omega)`.
     pub z_omega_evaluation: u256,
+    /// Permutation evaluation `z(zeta)`.
+    ///
+    /// Needed to evaluate the linearization polynomial `L(zeta)`; a verifier
+    /// must never trust this value without also checking the batched KZG
+    /// opening that binds it, which [`crate::plonk::PlonkProof`]'s canonical
+    /// encoding lets `soroban-zk-std::plonk_kzg::verify_plonk_full` do.
+    pub z_evaluation: u256,
+    /// Permutation evaluation `sigma_3(zeta)`.
+    pub s_sigma3_evaluation: u256,
     /// Quotient evaluation `t(zeta)`.
     pub quotient_evaluation: u256,
     /// Linearization evaluation `L(zeta)`.
@@ -78,6 +88,433 @@ impl PlonkField for Bn254 {
 }
 
 impl PlonkConfig for Bn254 {}
+
+// ============================================================================
+// Fiat-Shamir transcript (beta, gamma, alpha, zeta, v, u)
+// ============================================================================
+//
+// PLONK is made non-interactive with a SHA-256 hash chain.  Every prover
+// message is *absorbed* into a 32-byte chaining value and every challenge is a
+// fresh *squeeze* from it, so the challenges depend on the verifying key, the
+// public inputs and every commitment/evaluation sent before them.
+//
+// Domain separation is applied three ways: a fixed protocol tag, a per-
+// transcript domain separator, and a distinct one-byte prefix for absorb
+// (`0x00`) and squeeze (`0x01`) operations.  Each absorbed value is length-
+// prefixed with a label, which prevents ambiguous concatenations (e.g. two
+// 32-byte scalars absorbing the same bytes as one 64-byte point).
+
+/// Fixed domain-separation tag for the PLONK Fiat-Shamir transcript.
+pub const PLONK_TRANSCRIPT_TAG: &[u8] = b"soroban-zk/plonk/transcript/v1";
+
+/// A `no_std`, allocation-free Fiat-Shamir transcript.
+///
+/// The state is a single SHA-256 chaining value held on the stack.  Absorbing
+/// and squeezing both hash the current state with a label, so a transcript can
+/// be cloned or replayed deterministically without any heap traffic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlonkTranscript {
+    state: [u8; 32],
+}
+
+impl PlonkTranscript {
+    /// Starts a transcript bound to `domain_separator` (e.g. the verifier
+    /// circuit identifier), hashing [`PLONK_TRANSCRIPT_TAG`] first.
+    pub fn new(domain_separator: &[u8]) -> Self {
+        let mut state = [0u8; 32];
+        let mut hasher = Sha256::new();
+        hasher.update(PLONK_TRANSCRIPT_TAG);
+        state.copy_from_slice(&hasher.finalize());
+        let mut transcript = Self { state };
+        transcript.absorb_bytes(b"domain", domain_separator);
+        transcript
+    }
+
+    fn chain(state: &[u8; 32], mode: u8, label: &[u8], data: &[u8]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(state);
+        hasher.update([mode]);
+        hasher.update((label.len() as u32).to_be_bytes());
+        hasher.update(label);
+        hasher.update((data.len() as u64).to_be_bytes());
+        hasher.update(data);
+        let mut next = [0u8; 32];
+        next.copy_from_slice(&hasher.finalize());
+        next
+    }
+
+    /// Absorbs a labelled byte string.
+    pub fn absorb_bytes(&mut self, label: &[u8], data: &[u8]) {
+        self.state = Self::chain(&self.state, 0x00, label, data);
+    }
+
+    /// Absorbs a labelled scalar in canonical big-endian form.
+    pub fn absorb_scalar(&mut self, label: &[u8], value: u256) {
+        self.absorb_bytes(label, &value.to_be_bytes());
+    }
+
+    /// Absorbs a labelled G1 point as `x || y` (big-endian).
+    pub fn absorb_g1(&mut self, label: &[u8], point: &G1Affine) {
+        let mut bytes = [0u8; 64];
+        bytes[0..32].copy_from_slice(&point.x.to_be_bytes());
+        bytes[32..64].copy_from_slice(&point.y.to_be_bytes());
+        self.absorb_bytes(label, &bytes);
+    }
+
+    /// Absorbs a labelled `usize` counter (encoded as `u64` big-endian).
+    pub fn absorb_usize(&mut self, label: &[u8], value: usize) {
+        self.absorb_bytes(label, &(value as u64).to_be_bytes());
+    }
+
+    /// Squeezes 32 raw bytes (one SHA-256 block) for the given label.
+    pub fn squeeze_bytes(&mut self, label: &[u8]) -> [u8; 32] {
+        self.state = Self::chain(&self.state, 0x01, label, &[]);
+        self.state
+    }
+
+    /// Squeezes a scalar in `[1, r)`; a zero digest is mapped to one so that a
+    /// challenge can never silently annihilate a term of the protocol.
+    pub fn challenge(&mut self, label: &[u8]) -> u256 {
+        let value = u256::from_be_bytes(self.squeeze_bytes(label)) % Bn254::FR_MODULUS;
+        if value == u256::from(0u8) {
+            u256::from(1u8)
+        } else {
+            value
+        }
+    }
+
+    /// Derives the six PLONK challenges in protocol order.
+    pub fn derive_plonk_challenges(&mut self) -> PlonkFullChallenges {
+        PlonkFullChallenges {
+            beta: self.challenge(b"beta"),
+            gamma: self.challenge(b"gamma"),
+            alpha: self.challenge(b"alpha"),
+            zeta: self.challenge(b"zeta"),
+            v: self.challenge(b"v"),
+            u: self.challenge(b"u"),
+        }
+    }
+}
+
+/// The complete Fiat-Shamir challenge set for PLONK.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlonkFullChallenges {
+    /// Permutation challenge for the numerator terms.
+    pub beta: u256,
+    /// Permutation challenge for the denominator terms.
+    pub gamma: u256,
+    /// Linearization challenge.
+    pub alpha: u256,
+    /// Evaluation point.
+    pub zeta: u256,
+    /// Batching challenge for the `zeta`-side openings.
+    pub v: u256,
+    /// Batching challenge for the `zeta*omega`-side opening.
+    pub u: u256,
+}
+
+impl PlonkFullChallenges {
+    /// Projects the challenges consumed by [`evaluate_linearization`].
+    pub fn linearization_challenges(&self) -> PlonkChallenges {
+        PlonkChallenges {
+            alpha: self.alpha,
+            beta: self.beta,
+            gamma: self.gamma,
+            zeta: self.zeta,
+        }
+    }
+}
+
+// ============================================================================
+// Barycentric evaluation of the public-input polynomial PI(zeta)
+// ============================================================================
+//
+// Public inputs `p_0, ..., p_{k-1}` define the unique polynomial `PI(X)` of
+// degree `< n` with `PI(omega^i) = p_i`.  Its Lagrange form at `zeta` is
+//
+//     PI(zeta) = sum_{i<k} p_i * (omega^i / n) * (zeta^n - 1) / (zeta - omega^i)
+//
+// so evaluating it naively needs `k` field inversions.  The barycentric form
+// below computes the same value with a *single* inversion by using Montgomery's
+// batch-inversion trick over the `k` denominators `zeta - omega^i`, giving
+// `O(k)` field multiplications overall.
+
+/// Maximum number of public inputs accepted by
+/// [`barycentric_pi_evaluation`].
+///
+/// The bound keeps the batch-inversion scratch buffers on the stack: the
+/// function is `no_std` and allocation-free, so it must size its workspace at
+/// compile time.  A PLONK circuit with more public inputs than this should
+/// split its statement (or the constant can be raised deliberately).
+pub const MAX_BARYCENTRIC_INPUTS: usize = 256;
+
+/// Evaluates the public-input polynomial `PI(zeta)` in `O(k)` field operations.
+///
+/// # Errors
+///
+/// * [`ZkError::InvalidInput`] if `n == 0`, `public_inputs.len() > n`, or
+///   `public_inputs.len() > MAX_BARYCENTRIC_INPUTS`.
+/// * [`ZkError::InvalidFieldElement`] if `zeta`, `omega` or any public input is
+///   `>= r`, or if `zeta` lies in the evaluation domain (where the barycentric
+///   weights are undefined).
+pub fn barycentric_pi_evaluation(
+    public_inputs: &[u256],
+    zeta: u256,
+    omega: u256,
+    n: usize,
+) -> Result<u256, ZkError> {
+    let k = public_inputs.len();
+    if n == 0 || k > n || k > MAX_BARYCENTRIC_INPUTS {
+        return Err(ZkError::InvalidInput);
+    }
+    if zeta >= Bn254::FR_MODULUS || omega >= Bn254::FR_MODULUS {
+        return Err(ZkError::InvalidFieldElement);
+    }
+
+    // `zeta` must not be a root of unity of order `n`: there the Lagrange
+    // weights are undefined and the barycentric identity does not apply.
+    let zeta_pow_n = Bn254::pow(zeta, u256::from(n as u64));
+    let numerator = Bn254::sub(zeta_pow_n, u256::from(1u8));
+    if numerator == u256::from(0u8) {
+        return Err(ZkError::InvalidFieldElement);
+    }
+    if k == 0 {
+        return Ok(u256::from(0u8));
+    }
+
+    // Denominators d_i = zeta - omega^i, plus the prefix products used by the
+    // Montgomery batch inversion (prefix[0] = 1, prefix[i+1] = prefix[i]*d_i).
+    let mut denominators = [u256::from(0u8); MAX_BARYCENTRIC_INPUTS];
+    let mut prefix = [u256::from(0u8); MAX_BARYCENTRIC_INPUTS + 1];
+    let mut omega_pow = u256::from(1u8);
+    for i in 0..k {
+        if public_inputs[i] >= Bn254::FR_MODULUS {
+            return Err(ZkError::InvalidFieldElement);
+        }
+        let denominator = Bn254::sub(zeta, omega_pow);
+        if denominator == u256::from(0u8) {
+            return Err(ZkError::InvalidFieldElement);
+        }
+        denominators[i] = denominator;
+        omega_pow = Bn254::mul(omega_pow, omega);
+    }
+
+    prefix[0] = u256::from(1u8);
+    for i in 0..k {
+        prefix[i + 1] = Bn254::mul(prefix[i], denominators[i]);
+    }
+
+    // Walk backwards turning each denominator into its inverse, then sum
+    // `p_i * omega^i * d_i^{-1}` in a single forward pass.
+    let mut running_inverse = Bn254::invert(prefix[k]);
+    for i in (0..k).rev() {
+        let denominator = denominators[i];
+        denominators[i] = Bn254::mul(running_inverse, prefix[i]);
+        running_inverse = Bn254::mul(running_inverse, denominator);
+    }
+
+    let mut sum = u256::from(0u8);
+    let mut omega_pow = u256::from(1u8);
+    for i in 0..k {
+        let weighted = Bn254::mul(Bn254::mul(public_inputs[i], omega_pow), denominators[i]);
+        sum = Bn254::add(sum, weighted);
+        omega_pow = Bn254::mul(omega_pow, omega);
+    }
+
+    let n_inverse = Bn254::invert(u256::from(n as u64));
+    Ok(Bn254::mul(Bn254::mul(sum, numerator), n_inverse))
+}
+
+/// Folds the split quotient commitments into `[t]_1`:
+///
+/// ```text
+/// [t]_1 = [t_lo]_1 + zeta^n * [t_mid]_1 + zeta^{2n} * [t_hi]_1
+/// ```
+///
+/// PLONK splits `t(X)` into three degree-`< n` pieces because the SRS only
+/// guarantees powers up to `n`; the verifier must fold them back at `zeta`
+/// before batching the openings.
+///
+/// # Errors
+///
+/// * [`ZkError::InvalidInput`] if `n == 0`.
+/// * [`ZkError::InvalidFieldElement`] if `zeta >= r`.
+pub fn split_quotient_commitment(
+    quotient_commitments: &[G1Affine; 3],
+    zeta: u256,
+    n: usize,
+) -> Result<G1Affine, ZkError> {
+    if n == 0 {
+        return Err(ZkError::InvalidInput);
+    }
+    if zeta >= Bn254::FR_MODULUS {
+        return Err(ZkError::InvalidFieldElement);
+    }
+    let zeta_n = Bn254::pow(zeta, u256::from(n as u64));
+    let zeta_2n = Bn254::mul(zeta_n, zeta_n);
+
+    let lo = G1Projective::from(quotient_commitments[0]);
+    let mid = Bn254::g1_scalar_mul(G1Projective::from(quotient_commitments[1]), zeta_n);
+    let hi = Bn254::g1_scalar_mul(G1Projective::from(quotient_commitments[2]), zeta_2n);
+    Ok(lo.add(&mid).add(&hi).to_affine())
+}
+
+// ============================================================================
+// Canonical proof serialization
+// ============================================================================
+//
+// The encoding is fixed-width and big-endian so that decoding is unambiguous
+// and every scalar/point is re-validated at the boundary:
+//
+// | offset    | field                                    | width |
+// |-----------|------------------------------------------|-------|
+// | 0         | `wire_commitments[0..3]`                 | 192   |
+// | 192       | `z_commitment`                           | 64    |
+// | 256       | `quotient_commitments[0..3]`             | 192   |
+// | 448       | `w_zeta`                                 | 64    |
+// | 512       | `w_zeta_omega`                           | 64    |
+// | 576       | `wire_evaluations[0..3]`                 | 96    |
+// | 672       | `sigma_evaluations[0..2]`                | 64    |
+// | 736       | `z_omega_evaluation`                     | 32    |
+// | 768       | `z_evaluation`                           | 32    |
+// | 800       | `s_sigma3_evaluation`                    | 32    |
+// | 832       | `quotient_evaluation`                    | 32    |
+// | 864       | `linearization_evaluation`               | 32    |
+//
+// Points are `x || y` (32 bytes each, big-endian).  The all-zero 64-byte block
+// is the canonical encoding of the point at infinity.
+
+/// Exact byte length of [`PlonkProof::to_bytes`].
+pub const PLONK_PROOF_BYTES: usize = 896;
+
+fn decode_g1(bytes: &[u8]) -> Result<G1Affine, ZkError> {
+    if bytes.len() != 64 {
+        return Err(ZkError::DeserializationError);
+    }
+    let mut x_bytes = [0u8; 32];
+    let mut y_bytes = [0u8; 32];
+    x_bytes.copy_from_slice(&bytes[..32]);
+    y_bytes.copy_from_slice(&bytes[32..64]);
+    let x = u256::from_be_bytes(x_bytes);
+    let y = u256::from_be_bytes(y_bytes);
+    if x == u256::from(0u8) && y == u256::from(0u8) {
+        return Ok(G1Affine { x, y });
+    }
+    if !Bn254::is_valid_g1_subgroup(x, y) {
+        return Err(ZkError::DeserializationError);
+    }
+    Ok(G1Affine { x, y })
+}
+
+fn decode_fr(bytes: &[u8]) -> Result<u256, ZkError> {
+    if bytes.len() != 32 {
+        return Err(ZkError::DeserializationError);
+    }
+    let mut raw = [0u8; 32];
+    raw.copy_from_slice(bytes);
+    Bn254::fr_from_bytes(raw).ok_or(ZkError::DeserializationError)
+}
+
+fn encode_g1(point: &G1Affine, out: &mut [u8]) {
+    out[0..32].copy_from_slice(&point.x.to_be_bytes());
+    out[32..64].copy_from_slice(&point.y.to_be_bytes());
+}
+
+impl PlonkProof {
+    /// Decodes a proof from its canonical [`PlonkProof::to_bytes`] encoding.
+    ///
+    /// Every G1 point is checked for subgroup membership (the all-zero block is
+    /// accepted as infinity) and every evaluation must be a canonical scalar in
+    /// `[0, r)`.  Decoding never panics on malformed input.
+    ///
+    /// # Errors
+    ///
+    /// [`ZkError::DeserializationError`] on a wrong length, a non-canonical
+    /// scalar, an off-curve point, or a point outside the prime-order subgroup.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ZkError> {
+        if bytes.len() != PLONK_PROOF_BYTES {
+            return Err(ZkError::DeserializationError);
+        }
+        let mut points = [G1Affine {
+            x: u256::from(0u8),
+            y: u256::from(0u8),
+        }; 9];
+        for (index, point) in points.iter_mut().enumerate() {
+            let offset = index * 64;
+            *point = decode_g1(&bytes[offset..offset + 64])?;
+        }
+
+        let wire_commitments = [points[0], points[1], points[2]];
+        let z_commitment = points[3];
+        let quotient_commitments = [points[4], points[5], points[6]];
+        let w_zeta = points[7];
+        let w_zeta_omega = points[8];
+
+        // 9 points × 64 bytes = 576, then ten 32-byte scalars.
+        const SCALAR_BASE: usize = 576;
+        let scalar = |index: usize| {
+            let offset = SCALAR_BASE + index * 32;
+            decode_fr(&bytes[offset..offset + 32])
+        };
+        let wire_evaluations = [scalar(0)?, scalar(1)?, scalar(2)?];
+        let sigma_evaluations = [scalar(3)?, scalar(4)?];
+        let z_omega_evaluation = scalar(5)?;
+        let z_evaluation = scalar(6)?;
+        let s_sigma3_evaluation = scalar(7)?;
+        let quotient_evaluation = scalar(8)?;
+        let linearization_evaluation = scalar(9)?;
+
+        Ok(Self {
+            wire_commitments,
+            z_commitment,
+            quotient_commitments,
+            w_zeta,
+            w_zeta_omega,
+            wire_evaluations,
+            sigma_evaluations,
+            z_omega_evaluation,
+            z_evaluation,
+            s_sigma3_evaluation,
+            quotient_evaluation,
+            linearization_evaluation,
+        })
+    }
+
+    /// Encodes the proof in the canonical fixed-width form documented at
+    /// [`PLONK_PROOF_BYTES`].
+    pub fn to_bytes(&self) -> [u8; PLONK_PROOF_BYTES] {
+        let mut out = [0u8; PLONK_PROOF_BYTES];
+        let mut offset = 0usize;
+        for point in &self.wire_commitments {
+            encode_g1(point, &mut out[offset..offset + 64]);
+            offset += 64;
+        }
+        encode_g1(&self.z_commitment, &mut out[offset..offset + 64]);
+        offset += 64;
+        for point in &self.quotient_commitments {
+            encode_g1(point, &mut out[offset..offset + 64]);
+            offset += 64;
+        }
+        encode_g1(&self.w_zeta, &mut out[offset..offset + 64]);
+        offset += 64;
+        encode_g1(&self.w_zeta_omega, &mut out[offset..offset + 64]);
+        offset += 64;
+
+        let mut scalars = [u256::from(0u8); 10];
+        scalars[0..3].copy_from_slice(&self.wire_evaluations);
+        scalars[3..5].copy_from_slice(&self.sigma_evaluations);
+        scalars[5] = self.z_omega_evaluation;
+        scalars[6] = self.z_evaluation;
+        scalars[7] = self.s_sigma3_evaluation;
+        scalars[8] = self.quotient_evaluation;
+        scalars[9] = self.linearization_evaluation;
+        for scalar in scalars {
+            out[offset..offset + 32].copy_from_slice(&scalar.to_be_bytes());
+            offset += 32;
+        }
+        out
+    }
+}
 
 /// Evaluates the PLONK 3-wire arithmetic gate constraint.
 /// The constraint is defined as:
@@ -496,8 +933,10 @@ pub fn kzg_eval_proof_points(
 ///
 /// Returns [`ZkError::InvalidInput`] if `inputs` is empty.
 ///
-/// Returns [`ZkError::InvalidFieldElement`] if `batch_seed` reduces to zero
-/// modulo `r` (or a squaring collapses to zero — guarded for correctness).
+/// Returns [`ZkError::InvalidFieldElement`] if `batch_seed` reduces to zero or
+/// one modulo `r` (or a squaring collapses to either — both make the weights
+/// degenerate).  Prefer [`plonk_batch_verify_points_derived`], which cannot
+/// produce such a seed.
 ///
 /// Propagates the validation errors of [`kzg_eval_proof_points`] for any
 /// individual proof (length mismatches, out-of-range scalars/evaluations).
@@ -512,8 +951,11 @@ pub fn plonk_batch_verify_points(
     }
 
     // rho_0 = batch_seed mod r (big-endian interpretation of the seed).
+    // A zero weight drops a proof and a unit weight makes the power tower
+    // collapse to `1, 1, 1, ...`; both destroy the soundness of the random
+    // linear combination, so they are rejected instead of silently accepted.
     let mut rho = u256::from_be_bytes(*batch_seed) % Bn254::FR_MODULUS;
-    if rho == u256::from(0u8) {
+    if rho == u256::from(0u8) || rho == u256::from(1u8) {
         return Err(ZkError::InvalidFieldElement);
     }
 
@@ -531,13 +973,63 @@ pub fn plonk_batch_verify_points(
         // final iteration where the value is unused).
         if j + 1 < m {
             rho = Bn254::mul(rho, rho);
-            if rho == u256::from(0u8) {
+            if rho == u256::from(0u8) || rho == u256::from(1u8) {
                 return Err(ZkError::InvalidFieldElement);
             }
         }
     }
 
     Ok((lhs_acc.to_affine(), rhs_acc.to_affine()))
+}
+
+/// Derives the batch seed from a transcript that absorbs **every** batched
+/// proof.
+///
+/// `batch_seed` used to be a raw caller-supplied constant, which made it easy
+/// to pass a degenerate value (`1`, or an all-zero seed) and silently void the
+/// randomized combination.  This helper binds the seed to the full batch:
+/// every commitment, evaluation, opening proof and challenge of every proof is
+/// absorbed before a single 32-byte seed is squeezed, so changing any proof
+/// changes every batch scalar.
+///
+/// Soundness still requires the *first* proof of a batch to be unpredictable to
+/// the prover where the proofs are attacker-supplied; on-chain verification
+/// should therefore mix in ledger randomness (the batch itself only prevents a
+/// single malicious proof from adapting to its own weights).
+pub fn plonk_batch_seed_from_inputs(inputs: &[KzgEvalProofInputs<'_>]) -> [u8; 32] {
+    let mut transcript = PlonkTranscript::new(b"plonk-batch-v1");
+    transcript.absorb_usize(b"count", inputs.len());
+    for (index, input) in inputs.iter().enumerate() {
+        transcript.absorb_usize(b"index", index);
+        transcript.absorb_usize(b"k", input.commitments.len());
+        for commitment in input.commitments {
+            transcript.absorb_g1(b"commitment", commitment);
+        }
+        for evaluation in input.evaluations_at_zeta {
+            transcript.absorb_scalar(b"evaluation", *evaluation);
+        }
+        transcript.absorb_g1(b"commitment_omega", &input.commitment_at_zeta_omega);
+        transcript.absorb_scalar(b"evaluation_omega", input.evaluation_at_zeta_omega);
+        transcript.absorb_g1(b"w_zeta", &input.w_zeta);
+        transcript.absorb_g1(b"w_zeta_omega", &input.w_zeta_omega);
+        transcript.absorb_scalar(b"v", input.v);
+        transcript.absorb_scalar(b"u", input.u);
+        transcript.absorb_scalar(b"zeta", input.zeta);
+        transcript.absorb_scalar(b"omega", input.omega);
+    }
+    transcript.squeeze_bytes(b"rho")
+}
+
+/// Safe wrapper around [`plonk_batch_verify_points`] that derives `rho` from a
+/// transcript over the whole batch (see [`plonk_batch_seed_from_inputs`]).
+///
+/// Prefer this over passing a fixed `batch_seed`; it cannot be instantiated with
+/// the degenerate seeds that break the randomized combination.
+pub fn plonk_batch_verify_points_derived(
+    inputs: &[KzgEvalProofInputs<'_>],
+) -> Result<(G1Affine, G1Affine), ZkError> {
+    let seed = plonk_batch_seed_from_inputs(inputs);
+    plonk_batch_verify_points(inputs, &seed)
 }
 
 #[cfg(test)]
@@ -561,6 +1053,8 @@ mod tests {
             wire_evaluations: [u256::from(1u8); 3],
             sigma_evaluations: [u256::from(2u8); 2],
             z_omega_evaluation: u256::from(3u8),
+            z_evaluation: u256::from(6u8),
+            s_sigma3_evaluation: u256::from(7u8),
             quotient_evaluation: u256::from(4u8),
             linearization_evaluation: u256::from(5u8),
         }
@@ -1036,8 +1530,363 @@ mod tests {
         // Two different seeds must yield different combined points for the
         // same batch (sanity-check that the randomization actually applies).
         let inputs = [kzg_fixture(), kzg_fixture_alt()];
-        let p1 = plonk_batch_verify_points(&inputs, &[1u8; 32]).unwrap();
+        let p1 = plonk_batch_verify_points(&inputs, &[3u8; 32]).unwrap();
         let p2 = plonk_batch_verify_points(&inputs, &[2u8; 32]).unwrap();
         assert!(p1 != p2, "batch output must depend on the seed");
+    }
+
+    #[test]
+    fn plonk_batch_rejects_unit_seed() {
+        // A batch seed of 1 makes the power tower collapse to `1, 1, ...`,
+        // which silently disables the randomized combination.
+        let inputs = [kzg_fixture(), kzg_fixture_alt()];
+        let mut unit_seed = [0u8; 32];
+        unit_seed[31] = 1;
+        assert_eq!(
+            plonk_batch_verify_points(&inputs, &unit_seed),
+            Err(ZkError::InvalidFieldElement)
+        );
+    }
+
+    // =========================================================================
+    // Barycentric PI(zeta) tests
+    // =========================================================================
+
+    /// Finds a primitive 4th root of unity in Fr.
+    fn fourth_root_of_unity() -> u256 {
+        let exponent = (Bn254::FR_MODULUS - u256::from(1u8)) / u256::from(4u8);
+        let minus_one = Bn254::FR_MODULUS - u256::from(1u8);
+        let mut base = u256::from(2u8);
+        while base < u256::from(64u8) {
+            let candidate = Bn254::pow(base, exponent);
+            let square = Bn254::mul(candidate, candidate);
+            let fourth = Bn254::mul(square, square);
+            if fourth == u256::from(1u8) && square == minus_one {
+                return candidate;
+            }
+            base += u256::from(1u8);
+        }
+        unreachable!("Fr has a primitive 4th root of unity")
+    }
+
+    /// Straightforward Lagrange evaluation used as the reference for the
+    /// barycentric implementation (one inversion per term).
+    fn naive_pi(public_inputs: &[u256], zeta: u256, omega: u256, n: usize) -> u256 {
+        let n_fe = u256::from(n as u64);
+        let numerator = Bn254::sub(Bn254::pow(zeta, n_fe), u256::from(1u8));
+        let mut sum = u256::from(0u8);
+        let mut omega_pow = u256::from(1u8);
+        for input in public_inputs {
+            let denominator = Bn254::mul(n_fe, Bn254::sub(zeta, omega_pow));
+            if denominator != u256::from(0u8) {
+                let term = Bn254::mul(*input, Bn254::mul(omega_pow, Bn254::invert(denominator)));
+                sum = Bn254::add(sum, term);
+            }
+            omega_pow = Bn254::mul(omega_pow, omega);
+        }
+        Bn254::mul(sum, numerator)
+    }
+
+    #[test]
+    fn barycentric_pi_matches_naive_lagrange() {
+        let omega = fourth_root_of_unity();
+        let inputs = [u256::from(7u8), u256::from(11u8), u256::from(13u8)];
+        let zeta = u256::from(1000u64);
+        let got = barycentric_pi_evaluation(&inputs, zeta, omega, 4).expect("evaluation");
+        assert_eq!(got, naive_pi(&inputs, zeta, omega, 4));
+    }
+
+    #[test]
+    fn barycentric_pi_matches_naive_lagrange_with_full_domain() {
+        // k = n exercises every barycentric weight, including the last one.
+        let omega = fourth_root_of_unity();
+        let inputs = [
+            u256::from(2u8),
+            u256::from(3u8),
+            u256::from(5u8),
+            u256::from(7u8),
+        ];
+        let zeta = u256::from(123_456u64);
+        let got = barycentric_pi_evaluation(&inputs, zeta, omega, 4)
+            .expect("evaluation must succeed off the domain");
+        assert_eq!(got, naive_pi(&inputs, zeta, omega, 4));
+    }
+
+    #[test]
+    fn barycentric_pi_rejects_zeta_in_domain() {
+        let omega = fourth_root_of_unity();
+        let inputs = [u256::from(1u8), u256::from(2u8)];
+        assert_eq!(
+            barycentric_pi_evaluation(&inputs, omega, omega, 4),
+            Err(ZkError::InvalidFieldElement)
+        );
+        // zeta = 1 is always in the domain (omega^0).
+        assert_eq!(
+            barycentric_pi_evaluation(&inputs, u256::from(1u8), omega, 4),
+            Err(ZkError::InvalidFieldElement)
+        );
+    }
+
+    #[test]
+    fn barycentric_pi_rejects_malformed_boundaries() {
+        let inputs = [u256::from(1u8)];
+        assert_eq!(
+            barycentric_pi_evaluation(&inputs, u256::from(5u8), u256::from(1u8), 0),
+            Err(ZkError::InvalidInput)
+        );
+        // k > n
+        assert_eq!(
+            barycentric_pi_evaluation(&[inputs[0]; 3], u256::from(5u8), u256::from(1u8), 2),
+            Err(ZkError::InvalidInput)
+        );
+        // out-of-range public input
+        assert_eq!(
+            barycentric_pi_evaluation(
+                &[Bn254::FR_MODULUS],
+                u256::from(5u8),
+                Bn254::FR_MODULUS - u256::from(1u8),
+                2
+            ),
+            Err(ZkError::InvalidFieldElement)
+        );
+        // out-of-range zeta and omega
+        assert_eq!(
+            barycentric_pi_evaluation(&inputs, Bn254::FR_MODULUS, u256::from(1u8), 2),
+            Err(ZkError::InvalidFieldElement)
+        );
+        assert_eq!(
+            barycentric_pi_evaluation(&inputs, u256::from(5u8), Bn254::FR_MODULUS, 2),
+            Err(ZkError::InvalidFieldElement)
+        );
+        // empty public inputs: PI is the zero polynomial
+        assert_eq!(
+            barycentric_pi_evaluation(&[], u256::from(5u8), u256::from(1u8), 2),
+            Ok(u256::from(0u8))
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn barycentric_pi_handles_maximum_inputs() {
+        // k = n = MAX: the batch-inversion buffers are sized exactly, so this
+        // is the boundary case for the fixed stack workspace.
+        let omega = fourth_root_of_unity();
+        let n = MAX_BARYCENTRIC_INPUTS;
+        let inputs = [u256::from(1u8); MAX_BARYCENTRIC_INPUTS];
+        let zeta = u256::from(999_983u64);
+        let got = barycentric_pi_evaluation(&inputs, zeta, omega, n).expect("maximum size");
+        assert_eq!(got, naive_pi(&inputs, zeta, omega, n));
+        // One past the cap is rejected, not a panic.
+        assert_eq!(
+            barycentric_pi_evaluation(
+                &[u256::from(1u8); MAX_BARYCENTRIC_INPUTS + 1],
+                zeta,
+                omega,
+                MAX_BARYCENTRIC_INPUTS + 1
+            ),
+            Err(ZkError::InvalidInput)
+        );
+    }
+
+    // =========================================================================
+    // Split quotient commitment tests
+    // =========================================================================
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn split_quotient_commitment_matches_manual_fold() {
+        let generator = dummy_g1();
+        let commitments = [generator; 3];
+        let zeta = u256::from(6u8);
+        let n = 4;
+        let zeta_n = Bn254::pow(zeta, u256::from(n as u64));
+        let zeta_2n = Bn254::mul(zeta_n, zeta_n);
+
+        let expected = G1Projective::from(generator)
+            .add(&Bn254::g1_scalar_mul(G1Projective::from(generator), zeta_n))
+            .add(&Bn254::g1_scalar_mul(
+                G1Projective::from(generator),
+                zeta_2n,
+            ))
+            .to_affine();
+
+        assert_eq!(
+            split_quotient_commitment(&commitments, zeta, n),
+            Ok(expected)
+        );
+    }
+
+    #[test]
+    fn split_quotient_commitment_rejects_bad_domain() {
+        let commitments = [dummy_g1(); 3];
+        assert_eq!(
+            split_quotient_commitment(&commitments, u256::from(2u8), 0),
+            Err(ZkError::InvalidInput)
+        );
+        assert_eq!(
+            split_quotient_commitment(&commitments, Bn254::FR_MODULUS, 4),
+            Err(ZkError::InvalidFieldElement)
+        );
+    }
+
+    // =========================================================================
+    // Fiat-Shamir transcript tests
+    // =========================================================================
+
+    #[test]
+    fn transcript_is_deterministic_and_all_challenges_in_range() {
+        let mut first = PlonkTranscript::new(b"unit-test");
+        first.absorb_g1(b"wire", &dummy_g1());
+        first.absorb_scalar(b"eval", u256::from(42u8));
+        let challenges = first.derive_plonk_challenges();
+
+        let mut second = PlonkTranscript::new(b"unit-test");
+        second.absorb_g1(b"wire", &dummy_g1());
+        second.absorb_scalar(b"eval", u256::from(42u8));
+        assert_eq!(challenges, second.derive_plonk_challenges());
+
+        for value in [
+            challenges.beta,
+            challenges.gamma,
+            challenges.alpha,
+            challenges.zeta,
+            challenges.v,
+            challenges.u,
+        ] {
+            assert!(value < Bn254::FR_MODULUS);
+            assert!(value != u256::from(0u8));
+        }
+        assert_ne!(challenges.beta, challenges.gamma);
+        assert_ne!(challenges.v, challenges.u);
+    }
+
+    #[test]
+    fn transcript_binds_every_absorbed_message() {
+        let mut baseline = PlonkTranscript::new(b"binding");
+        baseline.absorb_scalar(b"x", u256::from(1u8));
+        let expected = baseline.derive_plonk_challenges();
+
+        let mut changed_scalar = PlonkTranscript::new(b"binding");
+        changed_scalar.absorb_scalar(b"x", u256::from(2u8));
+        assert_ne!(expected, changed_scalar.derive_plonk_challenges());
+
+        let mut changed_domain = PlonkTranscript::new(b"binding-2");
+        changed_domain.absorb_scalar(b"x", u256::from(1u8));
+        assert_ne!(expected, changed_domain.derive_plonk_challenges());
+
+        // Label separation: the same bytes under a different label must not
+        // produce the same challenge stream.
+        let mut relabelled = PlonkTranscript::new(b"binding");
+        relabelled.absorb_scalar(b"y", u256::from(1u8));
+        assert_ne!(expected, relabelled.derive_plonk_challenges());
+    }
+
+    #[test]
+    fn transcript_linearization_projection_matches() {
+        let mut transcript = PlonkTranscript::new(b"projection");
+        let challenges = transcript.derive_plonk_challenges();
+        let projected = challenges.linearization_challenges();
+        assert_eq!(projected.alpha, challenges.alpha);
+        assert_eq!(projected.beta, challenges.beta);
+        assert_eq!(projected.gamma, challenges.gamma);
+        assert_eq!(projected.zeta, challenges.zeta);
+    }
+
+    // =========================================================================
+    // Canonical encoding tests
+    // =========================================================================
+
+    #[test]
+    fn plonk_proof_bytes_round_trip() {
+        let proof = dummy_proof();
+        let bytes = proof.to_bytes();
+        assert_eq!(bytes.len(), PLONK_PROOF_BYTES);
+        assert_eq!(PlonkProof::from_bytes(&bytes), Ok(proof));
+    }
+
+    #[test]
+    fn plonk_proof_from_bytes_rejects_wrong_length() {
+        let bytes = dummy_proof().to_bytes();
+        assert_eq!(
+            PlonkProof::from_bytes(&bytes[..PLONK_PROOF_BYTES - 1]),
+            Err(ZkError::DeserializationError)
+        );
+        assert_eq!(
+            PlonkProof::from_bytes(&[]),
+            Err(ZkError::DeserializationError)
+        );
+    }
+
+    #[test]
+    fn plonk_proof_from_bytes_rejects_non_canonical_scalar() {
+        let mut bytes = dummy_proof().to_bytes();
+        // The last scalar is `linearization_evaluation`.
+        bytes[PLONK_PROOF_BYTES - 32..].copy_from_slice(&Bn254::FR_MODULUS.to_be_bytes());
+        assert_eq!(
+            PlonkProof::from_bytes(&bytes),
+            Err(ZkError::DeserializationError)
+        );
+    }
+
+    #[test]
+    fn plonk_proof_from_bytes_rejects_off_curve_point() {
+        let mut bytes = dummy_proof().to_bytes();
+        // `(1, 3)` is not on BN254 G1.
+        bytes[32..64].copy_from_slice(&u256::from(3u8).to_be_bytes());
+        assert_eq!(
+            PlonkProof::from_bytes(&bytes),
+            Err(ZkError::DeserializationError)
+        );
+    }
+
+    #[test]
+    fn plonk_proof_identity_points_are_canonical() {
+        let mut proof = dummy_proof();
+        proof.wire_commitments = [G1Affine {
+            x: u256::from(0u8),
+            y: u256::from(0u8),
+        }; 3];
+        let bytes = proof.to_bytes();
+        assert_eq!(PlonkProof::from_bytes(&bytes), Ok(proof));
+    }
+
+    // =========================================================================
+    // Transcript-derived batch seed tests
+    // =========================================================================
+
+    #[test]
+    fn derived_batch_seed_is_deterministic_and_bound_to_the_batch() {
+        let inputs = [kzg_fixture(), kzg_fixture_alt()];
+        let seed_a = plonk_batch_seed_from_inputs(&inputs);
+        let seed_b = plonk_batch_seed_from_inputs(&inputs);
+        assert_eq!(seed_a, seed_b);
+
+        let seed_single = plonk_batch_seed_from_inputs(&inputs[..1]);
+        assert_ne!(seed_a, seed_single);
+
+        // The derived seed must itself be usable (never degenerate).
+        assert_ne!(
+            u256::from_be_bytes(seed_a) % Bn254::FR_MODULUS,
+            u256::from(0u8)
+        );
+        assert_ne!(
+            u256::from_be_bytes(seed_a) % Bn254::FR_MODULUS,
+            u256::from(1u8)
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn derived_batch_matches_explicit_seed_path() {
+        let inputs = [kzg_fixture(), kzg_fixture_alt()];
+        let seed = plonk_batch_seed_from_inputs(&inputs);
+        assert_eq!(
+            plonk_batch_verify_points_derived(&inputs),
+            plonk_batch_verify_points(&inputs, &seed)
+        );
+        assert_eq!(
+            plonk_batch_verify_points_derived(&[]),
+            Err(ZkError::InvalidInput)
+        );
     }
 }

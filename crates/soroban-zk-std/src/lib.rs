@@ -26,10 +26,7 @@ pub use events::{
 pub use groth16::{groth16_verify, Groth16Proof, Groth16VerifyingKey};
 pub use halo2::{Halo2StorageKey, LookupTable, PermutationKey};
 pub use pairing::{pairing_check, G2Affine};
-pub use plonk_kzg::{
-    verify_plonk_full, verify_plonk_kzg, verify_plonk_kzg_batch, verify_plonk_kzg_batch_safe,
-    PlonkVerifyingKey,
-};
+pub use plonk_kzg::{verify_plonk_kzg, verify_plonk_kzg_batch};
 pub use vk::{
     clear_proof_context, clear_vk, load_vk, save_vk, set_proof_context, vk_from_bytes, vk_to_bytes,
     OwnedVerifyingKey, VerificationContext, VkMeta, VkStorageKey, G1_GENERATOR, G2_GENERATOR,
